@@ -3,6 +3,7 @@
 pub(crate) mod com_implementations;
 pub(crate) mod data_exchange;
 pub(crate) mod denormal;
+pub(crate) mod editor_state;
 pub(crate) mod module_info;
 pub(crate) mod module_loader;
 pub(crate) mod plugin_impl;

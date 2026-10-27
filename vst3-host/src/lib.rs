@@ -55,6 +55,7 @@
 #![deny(missing_docs)]
 
 pub mod audio;
+pub mod editor;
 pub mod error;
 pub mod host;
 pub mod midi;
@@ -91,6 +92,7 @@ pub use discovery::{
     BusLayout, ClassInfo, DetailedPluginInfo, FactoryInfo, PluginReport, SafeDiscoveryReport,
     SafeDiscoverySkip, DEFAULT_PROBE_TIMEOUT,
 };
+pub use editor::EditorHandle;
 #[cfg(feature = "egui-widgets")]
 pub use embed::{EditorRect, EmbeddedEditor};
 pub use error::{Error, Result};

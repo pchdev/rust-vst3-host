@@ -4,6 +4,22 @@ All notable changes to `vst3-host` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to follow
 [Semantic Versioning](https://semver.org/) (pre-1.0: new features bump the minor version).
 
+## [Unreleased]
+
+### Added
+
+- `EditorHandle`, from `Plugin::editor_handle`: the plugin's editor, usable on its UI thread
+  while the plugin itself is owned elsewhere, typically by a `RealtimePluginRunner` on the
+  audio thread. The editor (controller reference, attached view, plug frame, Linux run loop)
+  now lives in its own state, shared between the plugin and its handles, so driving the
+  editor no longer competes with `process_audio` for the plugin. `EditorHandle::service`
+  also applies parameter values set through the processor (e.g. `RtControl`) to the
+  controller, so the editor shows what the plugin plays. A handle never keeps the plugin
+  alive: the plugin closes its editor before terminating, after which every call fails.
+- `PluginWindow::for_editor` opens a window for an `EditorHandle`;
+  `service_platform_events` then also services the editor.
+- `editor_handle_smoke` example: an editor driven while a runner processes concurrently.
+
 ## [0.10.0] - 2026-10-09
 
 ### Added

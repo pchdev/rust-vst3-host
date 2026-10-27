@@ -3,9 +3,10 @@
 //! This module provides platform-specific window creation and management
 //! for VST3 plugin GUIs.
 
+use crate::editor::EditorHandle;
 use crate::error::{Error, Result};
-use crate::plugin::Plugin;
-use std::sync::{Arc, Mutex};
+use crate::plugin::{Plugin, WindowHandle};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(target_os = "macos")]
 use objc2::{rc::Retained, MainThreadMarker, MainThreadOnly};
@@ -118,9 +119,76 @@ struct XcbWindowState {
     window: xcb::x::Window,
 }
 
+/// Where a window's editor comes from.
+enum EditorSource {
+    /// The whole plugin, shared with the audio callback.
+    Plugin(Arc<Mutex<Plugin>>),
+    /// Just the editor, the plugin being owned elsewhere (e.g. by a `RealtimePluginRunner`).
+    Handle(EditorHandle),
+}
+
+/// Access to the editor for one operation: the locked plugin, or the editor handle.
+enum EditorAccess<'a> {
+    Plugin(MutexGuard<'a, Plugin>),
+    Handle(&'a EditorHandle),
+}
+
+impl EditorAccess<'_> {
+    fn has_editor(&self) -> bool {
+        match self {
+            EditorAccess::Plugin(plugin) => plugin.has_editor(),
+            EditorAccess::Handle(editor) => editor.has_editor(),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            EditorAccess::Plugin(plugin) => plugin.info().name.clone(),
+            EditorAccess::Handle(editor) => editor.plugin_name().to_string(),
+        }
+    }
+
+    fn get_editor_size(&self) -> Result<(i32, i32)> {
+        match self {
+            EditorAccess::Plugin(plugin) => plugin.get_editor_size(),
+            EditorAccess::Handle(editor) => editor.size(),
+        }
+    }
+
+    // Unused where no platform event changes the scale (only Windows DPI changes do).
+    #[allow(dead_code)]
+    fn set_editor_scale_factor(&mut self, factor: f32) -> Result<bool> {
+        match self {
+            EditorAccess::Plugin(plugin) => plugin.set_editor_scale_factor(factor),
+            EditorAccess::Handle(editor) => editor.set_scale_factor(factor),
+        }
+    }
+
+    fn open_editor(&mut self, parent: WindowHandle) -> Result<()> {
+        match self {
+            EditorAccess::Plugin(plugin) => plugin.open_editor(parent),
+            EditorAccess::Handle(editor) => editor.open(parent),
+        }
+    }
+
+    fn close_editor(&mut self) -> Result<()> {
+        match self {
+            EditorAccess::Plugin(plugin) => plugin.close_editor(),
+            EditorAccess::Handle(editor) => editor.close(),
+        }
+    }
+
+    fn take_editor_resize_request(&self) -> Option<(i32, i32)> {
+        match self {
+            EditorAccess::Plugin(plugin) => plugin.take_editor_resize_request(),
+            EditorAccess::Handle(editor) => editor.take_resize_request(),
+        }
+    }
+}
+
 /// A plugin window that manages the native window and plugin editor lifecycle
 pub struct PluginWindow {
-    plugin: Arc<Mutex<Plugin>>,
+    source: EditorSource,
     #[cfg(target_os = "macos")]
     native_window: Option<Retained<NSWindow>>,
     /// The view the plugin attached its editor into. Kept so a plugin-initiated resize can
@@ -138,8 +206,21 @@ pub struct PluginWindow {
 impl PluginWindow {
     /// Create a new plugin window for the given plugin
     pub fn new(plugin: Arc<Mutex<Plugin>>) -> Self {
+        Self::with_source(EditorSource::Plugin(plugin))
+    }
+
+    /// Create a window for an editor taken with
+    /// [`Plugin::editor_handle`](crate::Plugin::editor_handle), for a plugin owned elsewhere
+    /// (typically by a [`RealtimePluginRunner`](crate::RealtimePluginRunner) on the audio
+    /// thread). [`Self::service_platform_events`] then also services the editor itself (see
+    /// [`EditorHandle::service`]), so call it every UI frame.
+    pub fn for_editor(editor: EditorHandle) -> Self {
+        Self::with_source(EditorSource::Handle(editor))
+    }
+
+    fn with_source(source: EditorSource) -> Self {
         Self {
-            plugin,
+            source,
             #[cfg(any(
                 target_os = "macos",
                 target_os = "windows",
@@ -155,11 +236,7 @@ impl PluginWindow {
     /// Open the plugin window
     pub fn open(&mut self) -> Result<()> {
         // Check if plugin has editor
-        let has_editor = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .has_editor();
+        let has_editor = self.editor().has_editor();
         if !has_editor {
             return Err(Error::Other(
                 "Plugin does not have a GUI editor".to_string(),
@@ -173,20 +250,10 @@ impl PluginWindow {
         }
 
         // Get plugin info for window title
-        let plugin_info = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .info()
-            .clone();
+        let plugin_name = self.editor().name();
 
         // Try to get editor size
-        let (width, height) = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_editor_size()
-            .unwrap_or((800, 600));
+        let (width, height) = self.editor().get_editor_size().unwrap_or((800, 600));
 
         // Create native window
         #[cfg(target_os = "macos")]
@@ -221,7 +288,7 @@ impl PluginWindow {
             // SAFETY: standard AppKit setter on the main thread.
             unsafe { window.setReleasedWhenClosed(false) };
 
-            let title = NSString::from_str(&format!("{} - VST3", plugin_info.name));
+            let title = NSString::from_str(&format!("{} - VST3", plugin_name));
             window.setTitle(&title);
 
             // A container view, sized to the editor, that the plugin attaches its view into.
@@ -243,10 +310,7 @@ impl PluginWindow {
                     Retained::as_ptr(&container_view) as *mut std::ffi::c_void
                 )
             };
-            self.plugin
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .open_editor(window_handle)?;
+            self.editor().open_editor(window_handle)?;
 
             // Match the window to the editor size, then show and center it.
             window.setContentSize(container_frame.size);
@@ -277,7 +341,7 @@ impl PluginWindow {
                 RegisterClassExW(&wc);
 
                 // Create window
-                let window_title = format!("{} - VST3\0", plugin_info.name);
+                let window_title = format!("{} - VST3\0", plugin_name);
                 let window_name = window_title.encode_utf16().collect::<Vec<u16>>();
 
                 // Calculate window size including borders
@@ -322,7 +386,7 @@ impl PluginWindow {
                 // after the editor is detached (in `close()`, or the error arm below).
                 let window_handle =
                     crate::plugin::WindowHandle::from_hwnd(hwnd as *mut std::ffi::c_void);
-                let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
+                let mut plugin = self.editor();
                 let dpi = winapi::um::winuser::GetDpiForWindow(hwnd);
                 if let Some(scale_factor) = dpi_scale_factor(dpi) {
                     if let Err(error) = plugin.set_editor_scale_factor(scale_factor) {
@@ -384,7 +448,7 @@ impl PluginWindow {
                 .map_err(|e| Error::Other(format!("Failed to create X11 window: {e}")))?;
 
             // Window title.
-            let title = format!("{} - VST3", plugin_info.name);
+            let title = format!("{} - VST3", plugin_name);
             connection.send_request(&xcb::x::ChangeProperty {
                 mode: xcb::x::PropMode::Replace,
                 window,
@@ -398,10 +462,7 @@ impl PluginWindow {
             let _ = connection.flush();
 
             let handle = crate::plugin::WindowHandle::from_x11(window.resource_id());
-            self.plugin
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .open_editor(handle)?;
+            self.editor().open_editor(handle)?;
 
             self.native_window = Some(XcbWindowState { connection, window });
         }
@@ -439,7 +500,10 @@ impl PluginWindow {
         if self.native_window.is_none() {
             return Ok(());
         }
-        let Some(mut plugin) = self.try_lock_plugin() else {
+        if let EditorSource::Handle(editor) = &self.source {
+            editor.service();
+        }
+        let Some(mut plugin) = self.try_editor() else {
             return Ok(());
         };
 
@@ -464,11 +528,26 @@ impl PluginWindow {
     /// Take the plugin lock without blocking, recovering a lock poisoned by an unrelated panic
     /// (a poisoned mutex is permanent, and treating it as failure would stop servicing the
     /// editor for the rest of the session).
-    fn try_lock_plugin(&self) -> Option<std::sync::MutexGuard<'_, Plugin>> {
-        match self.plugin.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => None,
+    fn try_editor(&self) -> Option<EditorAccess<'_>> {
+        match &self.source {
+            EditorSource::Plugin(plugin) => match plugin.try_lock() {
+                Ok(guard) => Some(EditorAccess::Plugin(guard)),
+                Err(std::sync::TryLockError::Poisoned(poison)) => {
+                    Some(EditorAccess::Plugin(poison.into_inner()))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            },
+            EditorSource::Handle(editor) => Some(EditorAccess::Handle(editor)),
+        }
+    }
+
+    /// The editor, locking the plugin if it's shared, recovering a poisoned lock.
+    fn editor(&self) -> EditorAccess<'_> {
+        match &self.source {
+            EditorSource::Plugin(plugin) => {
+                EditorAccess::Plugin(plugin.lock().unwrap_or_else(|p| p.into_inner()))
+            }
+            EditorSource::Handle(editor) => EditorAccess::Handle(editor),
         }
     }
 
@@ -563,11 +642,7 @@ impl PluginWindow {
         // A poisoned lock (an earlier panic on the audio thread) is recovered rather than
         // skipped, exactly as every other lock site here does: skipping it would destroy the
         // native window with the plugin's view still attached to it.
-        let _ = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .close_editor();
+        let _ = self.editor().close_editor();
 
         // Then close the native window
         #[cfg(target_os = "macos")]

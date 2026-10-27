@@ -996,6 +996,16 @@ pub(crate) trait PluginInternal: Send {
     /// (fire due timers, dispatch ready file descriptors). No-op by default
     /// (non-Linux, or process isolation where the editor isn't bridged).
     fn service_run_loop(&mut self) {}
+
+    /// The editor state an [`EditorHandle`](crate::editor::EditorHandle) shares with the
+    /// plugin. Only in-process plugins have one.
+    fn editor_state(
+        &self,
+    ) -> Result<std::sync::Arc<std::sync::Mutex<crate::internal::editor_state::EditorState>>> {
+        Err(Error::Other(
+            "editor handles are only available for in-process plugins".to_string(),
+        ))
+    }
     fn get_parameter_changes(&self) -> Vec<(u32, f64)>;
     /// Drain the ordered parameter-edit gesture log (begin/change/end) the plugin's editor
     /// reported since the last call. Defaults to empty for implementations that don't capture
@@ -2164,6 +2174,20 @@ impl Plugin {
             .as_ref()
             .map(|i| i.has_editor())
             .unwrap_or(false)
+    }
+
+    /// A handle to this plugin's editor that stays usable once the plugin itself is owned
+    /// elsewhere, typically by a [`RealtimePluginRunner`](crate::RealtimePluginRunner) on the
+    /// audio thread. Take it on the thread that loaded the plugin, and use it there.
+    ///
+    /// The handle doesn't keep the plugin alive: see [`EditorHandle`]. Only in-process plugins
+    /// have one, process isolation doesn't bridge the editor.
+    pub fn editor_handle(&self) -> Result<crate::editor::EditorHandle> {
+        self.internal
+            .as_ref()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .editor_state()
+            .map(|state| crate::editor::EditorHandle::new(state, self.info().name.clone()))
     }
 
     /// Open the plugin editor window
