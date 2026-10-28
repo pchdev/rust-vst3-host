@@ -8,6 +8,8 @@ All notable changes to `vst3-host` are documented here. The format is based on
 
 ### Added
 
+- `RealtimePluginRunner::queue_parameter_at`: a parameter change for the processor, from the
+  thread running the runner, for changes derived on the audio thread (e.g. MIDI learn).
 - `EditorHandle`, from `Plugin::editor_handle`: the plugin's editor, usable on its UI thread
   while the plugin itself is owned elsewhere, typically by a `RealtimePluginRunner` on the
   audio thread. The editor (controller reference, attached view, plug frame, Linux run loop)

@@ -297,6 +297,18 @@ impl RealtimePluginRunner {
         plugin.process_audio(buffers)
     }
 
+    /// Queue a parameter change (normalized `0.0..=1.0`) for the processor at `sample_offset`
+    /// in the next [`process`](Self::process), from the thread running it: what queued
+    /// [`RtControl::set_parameter`] changes go through, without the queue. For a host
+    /// deriving parameter changes on the audio thread (e.g. MIDI learn). The controller isn't
+    /// told; an [`EditorHandle`](crate::EditorHandle) picks the value up when serviced.
+    pub fn queue_parameter_at(&mut self, id: u32, value: f64, sample_offset: i32) -> Result<()> {
+        self.plugin
+            .as_mut()
+            .expect("runner plugin missing")
+            .queue_processor_parameter_at(id, value, sample_offset)
+    }
+
     /// Borrow the underlying plugin (e.g. to read parameters or info). Do **not** call this
     /// from the audio thread while another thread might also touch the plugin.
     pub fn plugin(&self) -> &Plugin {
