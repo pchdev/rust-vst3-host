@@ -303,6 +303,14 @@ impl RealtimePluginRunner {
         self.plugin.as_ref().expect("runner plugin missing")
     }
 
+    /// Mutably borrow the underlying plugin, e.g. to restore its state with
+    /// [`Plugin::load_state`](crate::Plugin::load_state). Taking `&mut self` means nothing else
+    /// is processing the runner meanwhile: call it on the control thread once the runner was
+    /// handed back from the audio thread.
+    pub fn plugin_mut(&mut self) -> &mut Plugin {
+        self.plugin.as_mut().expect("runner plugin missing")
+    }
+
     /// Recover the owned plugin, consuming the runner.
     pub fn into_plugin(mut self) -> Plugin {
         self.plugin.take().expect("runner plugin missing")

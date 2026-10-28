@@ -19,6 +19,13 @@ All notable changes to `vst3-host` are documented here. The format is based on
 - `PluginWindow::for_editor` opens a window for an `EditorHandle`;
   `service_platform_events` then also services the editor.
 - `editor_handle_smoke` example: an editor driven while a runner processes concurrently.
+- `StateHandle`, from `Plugin::state_handle`: saves the plugin's state (`save_state`,
+  `save_preset`) from its control thread while the plugin is processed elsewhere, as hosts do
+  for autosaves. It shares the editor's component/controller references, released the same way
+  when the plugin terminates.
+- `RealtimePluginRunner::plugin_mut`, e.g. to restore state once the runner is back on the
+  control thread (`load_state` stops and deactivates the plugin, so it can't overlap
+  processing).
 
 ## [0.10.0] - 2026-10-09
 

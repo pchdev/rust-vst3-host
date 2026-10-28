@@ -26,7 +26,7 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::internal::editor_state::EditorState;
+use crate::internal::controller_state::ControllerState;
 use crate::plugin::WindowHandle;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -44,12 +44,12 @@ use std::thread;
 /// nothing) instead of reaching into an unloaded module.
 #[derive(Clone)]
 pub struct EditorHandle {
-    state: Arc<Mutex<EditorState>>,
+    state: Arc<Mutex<ControllerState>>,
     plugin_name: String,
 }
 
 impl EditorHandle {
-    pub(crate) fn new(state: Arc<Mutex<EditorState>>, plugin_name: String) -> Self {
+    pub(crate) fn new(state: Arc<Mutex<ControllerState>>, plugin_name: String) -> Self {
         EditorHandle { state, plugin_name }
     }
 
@@ -59,14 +59,14 @@ impl EditorHandle {
     }
 
     /// The shared state, recovering a lock poisoned by an unrelated panic.
-    fn state(&self) -> MutexGuard<'_, EditorState> {
+    fn state(&self) -> MutexGuard<'_, ControllerState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The state, if this is the plugin's control thread and the plugin is still alive.
-    fn checked_state(&self) -> Result<MutexGuard<'_, EditorState>> {
+    fn checked_state(&self) -> Result<MutexGuard<'_, ControllerState>> {
         let state = self.state();
         if state.is_released() {
             return Err(Error::Other("the plugin was destroyed".to_string()));

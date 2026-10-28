@@ -64,6 +64,7 @@ pub mod playback;
 pub mod plugin;
 pub mod realtime;
 pub mod simple;
+pub mod state;
 pub mod transport;
 pub mod window;
 
@@ -119,6 +120,7 @@ pub use plugin::{
     WindowHandle,
 };
 pub use realtime::{RealtimePluginRunner, RtControl};
+pub use state::StateHandle;
 pub use transport::{AutomationLane, BlockEvents, MidiClip, Timeline};
 pub use window::PluginWindow;
 

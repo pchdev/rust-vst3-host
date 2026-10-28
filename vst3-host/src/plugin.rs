@@ -997,13 +997,15 @@ pub(crate) trait PluginInternal: Send {
     /// (non-Linux, or process isolation where the editor isn't bridged).
     fn service_run_loop(&mut self) {}
 
-    /// The editor state an [`EditorHandle`](crate::editor::EditorHandle) shares with the
-    /// plugin. Only in-process plugins have one.
-    fn editor_state(
+    /// The state an [`EditorHandle`](crate::editor::EditorHandle) or a
+    /// [`StateHandle`](crate::state::StateHandle) shares with the plugin. Only in-process
+    /// plugins have one.
+    fn controller_state(
         &self,
-    ) -> Result<std::sync::Arc<std::sync::Mutex<crate::internal::editor_state::EditorState>>> {
+    ) -> Result<std::sync::Arc<std::sync::Mutex<crate::internal::controller_state::ControllerState>>>
+    {
         Err(Error::Other(
-            "editor handles are only available for in-process plugins".to_string(),
+            "editor and state handles are only available for in-process plugins".to_string(),
         ))
     }
     fn get_parameter_changes(&self) -> Vec<(u32, f64)>;
@@ -2186,8 +2188,22 @@ impl Plugin {
         self.internal
             .as_ref()
             .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
-            .editor_state()
+            .controller_state()
             .map(|state| crate::editor::EditorHandle::new(state, self.info().name.clone()))
+    }
+
+    /// A handle that saves this plugin's state while the plugin itself is owned elsewhere,
+    /// typically by a [`RealtimePluginRunner`](crate::RealtimePluginRunner) on the audio
+    /// thread. Take it on the thread that loaded the plugin, and use it there.
+    ///
+    /// The handle doesn't keep the plugin alive: see [`StateHandle`](crate::StateHandle). Only
+    /// in-process plugins have one.
+    pub fn state_handle(&self) -> Result<crate::state::StateHandle> {
+        self.internal
+            .as_ref()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .controller_state()
+            .map(|state| crate::state::StateHandle::new(state, self.info().clone()))
     }
 
     /// Open the plugin editor window

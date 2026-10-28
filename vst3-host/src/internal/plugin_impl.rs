@@ -5,10 +5,7 @@ use crate::{
     error::{Error, Result},
     midi::{MidiChannel, MidiEvent, PluginEvent},
     parameters::{Parameter, ParameterChange},
-    plugin::{
-        decode_state_snapshot, encode_state_snapshot, PluginInfo, PluginInternal, StateContext,
-        StateSnapshot,
-    },
+    plugin::{decode_state_snapshot, PluginInfo, PluginInternal, StateContext},
 };
 use crossbeam_queue::ArrayQueue;
 use std::ptr;
@@ -22,7 +19,7 @@ use vst3::{ComPtr, ComWrapper, Interface, Steinberg::Vst::*, Steinberg::*};
 
 #[cfg(target_os = "linux")]
 use super::com_implementations::RunLoopRegistry;
-use super::editor_state::EditorState;
+use super::controller_state::ControllerState;
 use super::{
     com_implementations::{
         create_event_list, create_host_application, create_host_plug_frame,
@@ -245,7 +242,7 @@ pub struct PluginImpl {
     // The editor: controller reference, attached view, plug frame, run loop. Shared with any
     // `EditorHandle`s, which drive it on the UI thread while the plugin may be owned elsewhere.
     // Released (editor closed, controller reference dropped) first thing in `Drop`.
-    editor: Arc<Mutex<EditorState>>,
+    editor: Arc<Mutex<ControllerState>>,
 
     // VST3 module handle (kept alive). Declared after every plugin-side COM reference above so
     // those are released while the module's vtables still exist, and before `_host_app` below.
@@ -1020,7 +1017,7 @@ impl PluginImpl {
     /// service call. The queue drops its oldest entry when full: the newest value for a
     /// parameter is the one worth showing.
     /// The editor state, recovering a lock poisoned by an unrelated panic.
-    fn editor(&self) -> std::sync::MutexGuard<'_, EditorState> {
+    fn editor(&self) -> std::sync::MutexGuard<'_, ControllerState> {
         self.editor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1477,6 +1474,7 @@ impl PluginImpl {
 
             let deferred_controller_sync = Arc::new(ArrayQueue::new(MAX_DEFERRED_CONTROLLER_SYNC));
             let editor_controller = controller.clone();
+            let editor_component = component.clone();
             let mut plugin = Self {
                 component,
                 processor,
@@ -1520,7 +1518,9 @@ impl PluginImpl {
                 output_events,
                 chunk_events: Vec::with_capacity(MAX_QUEUED_EVENTS),
                 output_events_owned: Arc::new(ArrayQueue::new(MAX_OUTPUT_MIDI)),
-                editor: Arc::new(Mutex::new(EditorState::new(
+                editor: Arc::new(Mutex::new(ControllerState::new(
+                    editor_component,
+                    single_component,
                     editor_controller,
                     has_gui,
                     plug_frame,
@@ -3320,10 +3320,11 @@ impl PluginInternal for PluginImpl {
         self.editor().take_resize_request()
     }
 
-    fn editor_state(&self) -> Result<Arc<Mutex<EditorState>>> {
+    fn controller_state(&self) -> Result<Arc<Mutex<ControllerState>>> {
         if thread::current().id() != self.control_thread {
             return Err(Error::Other(
-                "an editor handle must be taken on the thread that loaded the plugin".to_string(),
+                "editor and state handles must be taken on the thread that loaded the plugin"
+                    .to_string(),
             ));
         }
         Ok(self.editor.clone())
@@ -3996,50 +3997,7 @@ impl PluginInternal for PluginImpl {
     }
 
     fn save_state(&self) -> Result<Vec<u8>> {
-        self.drain_deferred_controller_sync();
-        unsafe {
-            let component_stream =
-                create_memory_stream_with_metadata(None, StreamStateType::Project);
-            let component_ptr = component_stream.to_com_ptr::<IBStream>().ok_or_else(|| {
-                Error::InterfaceError("Failed to create component state stream".into())
-            })?;
-            let result = self.component.getState(component_ptr.as_ptr());
-            if result != kResultOk {
-                return Err(Error::Other(format!(
-                    "Plugin does not provide state (getState: {result:#x})"
-                )));
-            }
-
-            // A single-component plugin's "controller" is the component itself, so asking it for
-            // its state returns the blob above a second time: the envelope would carry the same
-            // bytes twice, the combined size cap would effectively halve, and `load_state` would
-            // apply `setState` twice. `load_state` has the matching guard.
-            let controller = if let Some(controller) =
-                self.controller.as_ref().filter(|_| !self.single_component)
-            {
-                let stream = create_memory_stream_with_metadata(None, StreamStateType::Project);
-                let stream_ptr = stream.to_com_ptr::<IBStream>().ok_or_else(|| {
-                    Error::InterfaceError("Failed to create controller state stream".into())
-                })?;
-                let result = controller.getState(stream_ptr.as_ptr());
-                if result == kResultOk {
-                    Some(stream.to_vec())
-                } else if result == kNotImplemented || result == kResultFalse {
-                    None
-                } else {
-                    return Err(Error::Other(format!(
-                        "Failed to save controller state (getState: {result:#x})"
-                    )));
-                }
-            } else {
-                None
-            };
-
-            encode_state_snapshot(&StateSnapshot {
-                component: component_stream.to_vec(),
-                controller,
-            })
-        }
+        self.editor().save_state()
     }
 
     fn load_state_with_context(&mut self, data: &[u8], context: &StateContext) -> Result<()> {
@@ -5185,7 +5143,7 @@ mod midi_mapping_cache_tests {
 #[cfg(test)]
 mod editor_scale_tests {
     use super::*;
-    use crate::internal::editor_state::set_view_scale_factor;
+    use crate::internal::controller_state::set_view_scale_factor;
     use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use vst3::Class;
 

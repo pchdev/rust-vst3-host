@@ -1,13 +1,15 @@
-//! The editor half of an in-process plugin: its `IEditController`, the attached `IPlugView`
-//! and the host objects the view talks to.
+//! The UI-thread side of an in-process plugin: its `IEditController`, the attached `IPlugView`
+//! and the host objects the view talks to, plus the component reference saving state needs.
 //!
 //! VST3 keeps the editor and the processor apart: the editor lives on the UI thread while the
-//! processor runs on the audio thread. This state is therefore kept apart from the rest of
+//! processor runs on the audio thread, and hosts save state (`getState`) from the UI thread
+//! while processing goes on. This state is therefore kept apart from the rest of
 //! [`PluginImpl`](super::plugin_impl::PluginImpl), behind its own lock, so that an
-//! [`EditorHandle`](crate::editor::EditorHandle) can drive the editor while the plugin itself
-//! is owned elsewhere (e.g. by a [`RealtimePluginRunner`](crate::realtime::RealtimePluginRunner)).
-//! The plugin [`release`](EditorState::release)s it before terminating, after which every
-//! editor call fails cleanly instead of reaching into an unloaded module.
+//! [`EditorHandle`](crate::editor::EditorHandle) or a [`StateHandle`](crate::state::StateHandle)
+//! can use it while the plugin itself is owned elsewhere (e.g. by a
+//! [`RealtimePluginRunner`](crate::realtime::RealtimePluginRunner)). The plugin
+//! [`release`](ControllerState::release)s it before terminating, after which every call fails
+//! cleanly instead of reaching into an unloaded module.
 
 use crate::error::{Error, Result};
 use crossbeam_queue::ArrayQueue;
@@ -18,11 +20,18 @@ use vst3::Steinberg::{
 };
 use vst3::{ComPtr, ComWrapper, Steinberg::Vst::*, Steinberg::*};
 
-use super::com_implementations::HostPlugFrame;
 #[cfg(target_os = "linux")]
 use super::com_implementations::RunLoopRegistry;
+use super::com_implementations::{
+    create_memory_stream_with_metadata, HostPlugFrame, StreamStateType,
+};
+use crate::plugin::{encode_state_snapshot, StateSnapshot};
 
-pub(crate) struct EditorState {
+pub(crate) struct ControllerState {
+    /// `None` once the plugin was released, like `controller`.
+    component: Option<ComPtr<IComponent>>,
+    /// The component is the controller too, see `save_state`.
+    single_component: bool,
     /// `None` once the plugin was released: every call then fails.
     controller: Option<ComPtr<IEditController>>,
     /// From the plugin's metadata, see `has_editor`.
@@ -42,8 +51,12 @@ pub(crate) struct EditorState {
     control_thread: ThreadId,
 }
 
-impl EditorState {
+impl ControllerState {
+    // One argument per shared object, all built by the plugin's loader.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        component: ComPtr<IComponent>,
+        single_component: bool,
         controller: Option<ComPtr<IEditController>>,
         has_gui: bool,
         plug_frame: ComWrapper<HostPlugFrame>,
@@ -51,7 +64,9 @@ impl EditorState {
         #[cfg(target_os = "linux")] run_loop: Arc<Mutex<RunLoopRegistry>>,
         deferred_controller_sync: Arc<ArrayQueue<(u32, f64)>>,
     ) -> Self {
-        EditorState {
+        ControllerState {
+            component: Some(component),
+            single_component,
             controller,
             has_gui,
             view: None,
@@ -65,16 +80,73 @@ impl EditorState {
         }
     }
 
-    /// Closes the editor and drops the controller reference. Called by the plugin before it
-    /// terminates: from then on the editor can't be opened again.
+    /// Closes the editor and drops the component and controller references. Called by the
+    /// plugin before it terminates: from then on the editor can't be opened again, nor the
+    /// state saved.
     pub(crate) fn release(&mut self) {
         let _ = self.close();
         self.controller = None;
+        self.component = None;
         self.has_gui = false;
     }
 
     pub(crate) fn is_released(&self) -> bool {
-        self.controller.is_none()
+        self.component.is_none()
+    }
+
+    /// The plugin's state, as `Plugin::save_state` returns it. Only reads the component and
+    /// the controller (`getState`), which hosts do from the UI thread while processing goes
+    /// on, so it doesn't need the rest of the plugin.
+    pub(crate) fn save_state(&self) -> Result<Vec<u8>> {
+        // So the controller's state includes values set through the processor.
+        self.apply_deferred_controller_sync();
+        let component = self
+            .component
+            .as_ref()
+            .ok_or_else(|| Error::Other("the plugin was destroyed".to_string()))?;
+        unsafe {
+            let component_stream =
+                create_memory_stream_with_metadata(None, StreamStateType::Project);
+            let component_ptr = component_stream.to_com_ptr::<IBStream>().ok_or_else(|| {
+                Error::InterfaceError("Failed to create component state stream".into())
+            })?;
+            let result = component.getState(component_ptr.as_ptr());
+            if result != kResultOk {
+                return Err(Error::Other(format!(
+                    "Plugin does not provide state (getState: {result:#x})"
+                )));
+            }
+
+            // A single-component plugin's "controller" is the component itself, so asking it for
+            // its state returns the blob above a second time: the envelope would carry the same
+            // bytes twice, the combined size cap would effectively halve, and `load_state` would
+            // apply `setState` twice. `load_state` has the matching guard.
+            let controller = if let Some(controller) =
+                self.controller.as_ref().filter(|_| !self.single_component)
+            {
+                let stream = create_memory_stream_with_metadata(None, StreamStateType::Project);
+                let stream_ptr = stream.to_com_ptr::<IBStream>().ok_or_else(|| {
+                    Error::InterfaceError("Failed to create controller state stream".into())
+                })?;
+                let result = controller.getState(stream_ptr.as_ptr());
+                if result == kResultOk {
+                    Some(stream.to_vec())
+                } else if result == kNotImplemented || result == kResultFalse {
+                    None
+                } else {
+                    return Err(Error::Other(format!(
+                        "Failed to save controller state (getState: {result:#x})"
+                    )));
+                }
+            } else {
+                None
+            };
+
+            encode_state_snapshot(&StateSnapshot {
+                component: component_stream.to_vec(),
+                controller,
+            })
+        }
     }
 
     pub(crate) fn control_thread(&self) -> ThreadId {
